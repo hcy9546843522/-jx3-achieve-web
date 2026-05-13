@@ -172,6 +172,9 @@ async def index(request: Request):
                 </form>
                 <div class="tip-text">查询过程需要拉取官方实时数据，提交后请耐心等待 3~8 秒。</div>
             </div>
+            <div style="text-align:center; padding: 12px 0;">
+                <a href="https://docs.qq.com/doc/DQXV1WVhsYmtMVVRY" target="_blank" style="color:#3b82f6; font-size:14px; text-decoration:none; font-weight:500; border-bottom:1px dashed #3b82f6;">📖 使用说明文档</a>
+            </div>
         </div>
 
         <script>
