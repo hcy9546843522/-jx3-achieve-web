@@ -1,4 +1,9 @@
 {
+  "functions": {
+    "api/index.py": {
+      "regions": ["hkg1"]
+    }
+  },
   "rewrites": [
     {
       "source": "/(.*)",
