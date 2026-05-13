@@ -2,4 +2,3 @@
 python-multipart
 uvicorn
 requests
-supabase
