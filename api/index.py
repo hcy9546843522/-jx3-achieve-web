@@ -146,6 +146,8 @@ async def index(request: Request):
             .uid-item b {{ color: var(--primary); }}
             .del-btn {{ background: #fee2e2; color: #ef4444; border-radius: 4px; padding: 4px 8px; font-size: 12px; cursor: pointer; font-weight: bold; }}
             .del-btn:hover {{ background: #fecaca; }}
+            .copy-btn {{ background: #e0f2fe; color: #3b82f6; border-radius: 4px; padding: 4px 8px; font-size: 12px; cursor: pointer; font-weight: bold; }}
+            .copy-btn:hover {{ background: #bae6fd; }}
 
             /* 主查询区 */
             .generate-card {{ background: linear-gradient(145deg, #ffffff, #f8fafc); border: 2px solid var(--primary); }}
@@ -221,7 +223,10 @@ async def index(request: Request):
                 list.innerHTML = data.uids.map(x => `
                     <div class="uid-item">
                         <span>UID: ${{x.jx3_uid}} <span style="color:#cbd5e1; margin:0 6px;">|</span> 备注: <b>${{x.alias_name}}</b></span>
-                        <span class="del-btn" onclick="delUid('${{x.jx3_uid}}')">删除</span>
+                        <div>
+                            <span class="copy-btn" onclick="copyUid('${{x.jx3_uid}}')">复制</span>
+                            <span class="del-btn" onclick="delUid('${{x.jx3_uid}}')">删除</span>
+                        </div>
                     </div>
                 `).join('');
             }}
@@ -229,6 +234,24 @@ async def index(request: Request):
             async function delUid(uid) {{
                 await fetch('/api/del_uid?jx3_uid='+uid, {{ method:'DELETE' }});
                 loadUids();
+            }}
+
+            function copyUid(uid) {{
+                if (navigator.clipboard && window.isSecureContext) {{
+                    navigator.clipboard.writeText(uid).then(() => showMsg('已复制 UID: ' + uid, '#10b981'));
+                }} else {{
+                    const textArea = document.createElement("textarea");
+                    textArea.value = uid;
+                    document.body.appendChild(textArea);
+                    textArea.select();
+                    try {{
+                        document.execCommand('copy');
+                        showMsg('已复制 UID: ' + uid, '#10b981');
+                    }} catch (err) {{
+                        showMsg('复制失败，请手动选择复制', '#ef4444');
+                    }}
+                    document.body.removeChild(textArea);
+                }}
             }}
 
             {init_script}
@@ -739,6 +762,24 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
                     document.getElementById(e.currentTarget.dataset.target).value = "all";
                     applyFilters();
                 }});
+            }});
+            // Badge 点击快捷筛选
+            document.getElementById('table-body').addEventListener('click', function(e) {{
+                const badge = e.target.closest('.badge');
+                if (!badge) return;
+                if (badge.classList.contains('badge-scene')) {{
+                    document.getElementById('filter-scene').value = badge.dataset.val;
+                }} else if (badge.classList.contains('badge-layer')) {{
+                    document.getElementById('filter-layer').value = badge.dataset.val;
+                }} else if (badge.classList.contains('badge-level')) {{
+                    document.getElementById('filter-level').value = badge.dataset.val;
+                }} else if (badge.classList.contains('badge-status')) {{
+                    const uid = badge.dataset.uid;
+                    document.getElementById('filter-status-' + uid).value = badge.dataset.val;
+                }} else {{
+                    return;
+                }}
+                applyFilters();
             }});
             function initGlobalSearch() {{
                 const input = document.getElementById('global-search');
