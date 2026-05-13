@@ -863,7 +863,12 @@ async def generate_dashboard(request: Request, jx3ids: str = Form(...)):
         for index, full_id in enumerate(jx3id_list):
             sid = short_ids[index]
             api_url = f"https://next2.jx3box.com/api/next2/user-achievements?jx3id={full_id}"
-            resp = requests.get(api_url, headers=headers, timeout=10)
+            try:
+                resp = requests.get(api_url, headers=headers, timeout=30)
+            except requests.exceptions.Timeout:
+                return f"<h3>请求账号 {full_id} 超时（服务器位于境外，跨网访问剑三API较慢，请稍后重试）。</h3>"
+            except requests.exceptions.ConnectionError:
+                return f"<h3>无法连接剑三数据服务器，请稍后重试。账号：{full_id}</h3>"
             if resp.status_code != 200:
                 return f"<h3>请求账号 {full_id} 失败，请检查 ID 是否正确或稍后再试。</h3>"
 
