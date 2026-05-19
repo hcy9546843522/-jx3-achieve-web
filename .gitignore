@@ -1,4 +1,40 @@
+# === Python 编译缓存 ===
 __pycache__/
 *.pyc
-.vercel
+*.pyo
+
+# === 虚拟环境 ===
+venv/
+env/
+.env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# === 本地数据库（红线！包含密码哈希） ===
+jx3_local.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# === 备份与导出数据 ===
+tcb_backup.json
+*.json.gz
+
+# === 环境变量 & 密钥 ===
 .env
+.env.*
+*.key
+*.pem
+
+# === IDE & 编辑器 ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# === 系统文件 ===
+.DS_Store
+Thumbs.db

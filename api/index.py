@@ -6,9 +6,10 @@ import os
 import hashlib
 import gzip
 import time
-
-
-
+import httpx
+import asyncio
+import sqlite3
+import uuid
 
 app = FastAPI()
 
@@ -16,22 +17,81 @@ app = FastAPI()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL_JSON_FILE = os.path.join(BASE_DIR, "jx3_all_backup.json")
 
+# 本地 SQLite 数据库路径
+DB_PATH = os.path.join(BASE_DIR, "jx3_local.db")
+
 COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f43f5e"]
 
-# ---- CloudBase 缓存配置 (安全脱敏版：从环境变量读取) ----
-TCB_ENV_ID = os.environ.get("TCB_ENV_ID", "此处防止本地报错可留空")
-TCB_API_KEY = os.environ.get("TCB_API_KEY", "此处防止本地报错可留空")
 
-TCB_BASE_URL = f"https://{TCB_ENV_ID}.api.tcloudbasegateway.com"
-TCB_COLLECTION_URL = f"{TCB_BASE_URL}/v1/database/instances/(default)/databases/(default)/collections/html_cache"
-TCB_USERS_URL = f"{TCB_BASE_URL}/v1/database/instances/(default)/databases/(default)/collections/users"
-TCB_JX3IDS_URL = f"{TCB_BASE_URL}/v1/database/instances/(default)/databases/(default)/collections/user_jx3ids"
-TCB_QUERY_LOGS_URL = f"{TCB_BASE_URL}/v1/database/instances/(default)/databases/(default)/collections/query_logs"
+# ==========================================
+# 数据库初始化 (sqlite3 本地化)
+# ==========================================
+def init_db():
+    print("DEBUG: 正在初始化本地 SQLite 数据库...")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_jx3ids (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            jx3_uid TEXT NOT NULL,
+            alias_name TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS html_cache (
+            id TEXT PRIMARY KEY,
+            raw_data TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS query_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query_uids TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print(f"DEBUG: 数据库初始化完成，路径: {DB_PATH}")
 
-TCB_HEADERS = {
-    "Authorization": f"Bearer {TCB_API_KEY}",
-    "Content-Type": "application/json",
-}
+
+@app.on_event("startup")
+async def startup_db():
+    init_db()
+
+
+# ==========================================
+# 新增模块：异步并发拉取地图事件
+# ==========================================
+async def fetch_all_events():
+    urls = {
+        "楚天社": "https://cms.jx3box.com/api/cms/game/celebrity?type=0",
+        "云从社": "https://cms.jx3box.com/api/cms/game/celebrity?type=1",
+        "披风会": "https://cms.jx3box.com/api/cms/game/celebrity?type=2",
+        "穹野卫": "https://cms.jx3box.com/api/cms/game/celebrity?type=3"
+    }
+    events_data = {}
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        tasks = [client.get(url) for url in urls.values()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for name, res in zip(urls.keys(), results):
+            if not isinstance(res, Exception) and res.status_code == 200:
+                events_data[name] = res.json().get("data", [])
+            else:
+                events_data[name] = []
+    return events_data
+
 
 # ---- 管理员白名单 (从环境变量动态解析，支持多个邮箱用逗号分隔) ----
 admin_emails_raw = os.environ.get("ADMIN_EMAILS", "")
@@ -261,7 +321,7 @@ async def index(request: Request):
     """
 
 
-# ---- 账户体系 API ----
+# ---- 账户体系 API (完全重构为 SQLite) ----
 @app.post("/api/register")
 async def api_register(request: Request):
     try:
@@ -270,33 +330,28 @@ async def api_register(request: Request):
         password = body.get("password", "").strip()
         if not email or not password:
             return {"detail": "邮箱和密码不能为空"}
-        import hashlib as _h
-        pw_hash = _h.sha256(password.encode()).hexdigest()
-        # 检查是否已存在（加 limit 防 TCB 忽略 where）
-        check = requests.get(
-            f"{TCB_USERS_URL}/documents",
-            params={"where": json.dumps({"email": email}), "limit": 100},
-            headers=TCB_HEADERS, timeout=10
-        )
-        if check.status_code == 200:
-            body_c = check.json()
-            docs = body_c.get("list") or body_c.get("data") or []
-            if isinstance(docs, list):
-                for d in docs:
-                    if d.get("email") == email:
-                        return {"detail": "邮箱已注册"}
-        # 插入
-        resp = requests.post(
-            f"{TCB_USERS_URL}/documents",
-            json={"data": [{"email": email, "password": pw_hash}]},
-            headers=TCB_HEADERS, timeout=10
-        )
-        if resp.status_code in (200, 201):
+
+        pw_hash = hashlib.sha256(password.encode()).hexdigest()
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            # 检查是否已存在
+            cur = conn.execute("SELECT id FROM users WHERE email=?", (email,))
+            if cur.fetchone():
+                return {"detail": "邮箱已注册"}
+
+            # 插入新用户
+            conn.execute("INSERT INTO users (email, password) VALUES (?, ?)", (email, pw_hash))
+            conn.commit()
+
             response = JSONResponse({"detail": "注册成功"})
-            response.set_cookie("session_user", email, path="/", max_age=86400*30)
+            response.set_cookie("session_user", email, path="/", max_age=86400 * 30)
             return response
-        return {"detail": f"注册失败: {resp.text[:200]}"}
+        finally:
+            conn.close()
     except Exception as e:
+        print(f"DEBUG: 注册接口报错 {e}")
         return {"detail": f"服务器错误: {str(e)}"}
 
 
@@ -308,33 +363,26 @@ async def api_login(request: Request):
         password = body.get("password", "").strip()
         if not email or not password:
             return {"detail": "邮箱和密码不能为空"}
-        import hashlib as _h
-        pw_hash = _h.sha256(password.encode()).hexdigest()
-        resp = requests.get(
-            f"{TCB_USERS_URL}/documents",
-            params={"where": json.dumps({"email": email}), "limit": 100},
-            headers=TCB_HEADERS, timeout=10
-        )
-        if resp.status_code != 200:
-            return {"detail": "数据库查询失败"}
-        body_r = resp.json()
-        docs = body_r.get("list") or body_r.get("data") or []
-        if not isinstance(docs, list) or len(docs) == 0:
-            return {"detail": "邮箱未注册"}
-        # 二次精确遍历，防止 TCB 忽略 where 条件
-        user = None
-        for d in docs:
-            if d.get("email") == email:
-                user = d
-                break
-        if not user:
-            return {"detail": "邮箱未注册"}
-        if user.get("password") != pw_hash:
-            return {"detail": "密码错误"}
-        response = JSONResponse({"detail": "登录成功"})
-        response.set_cookie("session_user", email, path="/", max_age=86400*30)
-        return response
+
+        pw_hash = hashlib.sha256(password.encode()).hexdigest()
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.execute("SELECT password FROM users WHERE email=?", (email,))
+            row = cur.fetchone()
+            if not row:
+                return {"detail": "邮箱未注册"}
+            if row["password"] != pw_hash:
+                return {"detail": "密码错误"}
+
+            response = JSONResponse({"detail": "登录成功"})
+            response.set_cookie("session_user", email, path="/", max_age=86400 * 30)
+            return response
+        finally:
+            conn.close()
     except Exception as e:
+        print(f"DEBUG: 登录接口报错 {e}")
         return {"detail": f"服务器错误: {str(e)}"}
 
 
@@ -349,39 +397,24 @@ async def api_save_uid(request: Request):
         alias_name = body.get("alias_name", "").strip()
         if not jx3_uid or not alias_name:
             return {"detail": "JX3ID 和备注名不能为空"}
-        # 拉取该用户所有记录，客户端二次匹配
-        check = requests.get(
-            f"{TCB_JX3IDS_URL}/documents",
-            params={"where": json.dumps({"email": session_user}), "limit": 100},
-            headers=TCB_HEADERS, timeout=10
-        )
-        existing_id = None
-        if check.status_code == 200:
-            body_c = check.json()
-            docs = body_c.get("list") or body_c.get("data") or []
-            if isinstance(docs, list):
-                for d in docs:
-                    if d.get("email") == session_user and d.get("jx3_uid") == jx3_uid:
-                        existing_id = d.get("_id") or d.get("id")
-                        break
-        if existing_id:
-            # 更新
-            resp = requests.patch(
-                f"{TCB_JX3IDS_URL}/documents/{existing_id}",
-                json={"data": {"alias_name": alias_name}},
-                headers=TCB_HEADERS, timeout=10
-            )
-        else:
-            # 新增
-            resp = requests.post(
-                f"{TCB_JX3IDS_URL}/documents",
-                json={"data": [{"email": session_user, "jx3_uid": jx3_uid, "alias_name": alias_name}]},
-                headers=TCB_HEADERS, timeout=10
-            )
-        if resp.status_code in (200, 201):
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            # 查询是否存在该 UID
+            cur = conn.execute("SELECT id FROM user_jx3ids WHERE email=? AND jx3_uid=?", (session_user, jx3_uid))
+            row = cur.fetchone()
+            if row:
+                conn.execute("UPDATE user_jx3ids SET alias_name=? WHERE id=?", (alias_name, row["id"]))
+            else:
+                conn.execute("INSERT INTO user_jx3ids (email, jx3_uid, alias_name) VALUES (?, ?, ?)",
+                             (session_user, jx3_uid, alias_name))
+            conn.commit()
             return {"detail": "保存成功"}
-        return {"detail": f"保存失败: {resp.text[:200]}"}
+        finally:
+            conn.close()
     except Exception as e:
+        print(f"DEBUG: 保存UID接口报错 {e}")
         return {"detail": f"服务器错误: {str(e)}"}
 
 
@@ -391,22 +424,17 @@ async def api_my_uids(request: Request):
     if not session_user:
         return {"uids": []}
     try:
-        resp = requests.get(
-            f"{TCB_JX3IDS_URL}/documents",
-            params={"where": json.dumps({"email": session_user}), "limit": 100},
-            headers=TCB_HEADERS, timeout=10
-        )
-        if resp.status_code == 200:
-            body = resp.json()
-            docs = body.get("list") or body.get("data") or []
-            if isinstance(docs, list):
-                result = []
-                for d in docs:
-                    if d.get("email") == session_user:
-                        result.append({"jx3_uid": d.get("jx3_uid"), "alias_name": d.get("alias_name")})
-                return {"uids": result}
-        return {"uids": []}
-    except Exception:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.execute("SELECT jx3_uid, alias_name FROM user_jx3ids WHERE email=?", (session_user,))
+            rows = cur.fetchall()
+            result = [{"jx3_uid": r["jx3_uid"], "alias_name": r["alias_name"]} for r in rows]
+            return {"uids": result}
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"DEBUG: 查询UID接口报错 {e}")
         return {"uids": []}
 
 
@@ -416,33 +444,26 @@ async def api_del_uid(request: Request, jx3_uid: str = ""):
     if not session_user:
         return {"detail": "请先登录"}
     try:
-        check = requests.get(
-            f"{TCB_JX3IDS_URL}/documents",
-            params={"where": json.dumps({"email": session_user}), "limit": 100},
-            headers=TCB_HEADERS, timeout=10
-        )
-        if check.status_code == 200:
-            body_c = check.json()
-            docs = body_c.get("list") or body_c.get("data") or []
-            if isinstance(docs, list):
-                for d in docs:
-                    if d.get("email") == session_user and d.get("jx3_uid") == jx3_uid:
-                        doc_id = d.get("_id") or d.get("id")
-                        requests.delete(
-                            f"{TCB_JX3IDS_URL}/documents/{doc_id}",
-                            headers=TCB_HEADERS, timeout=10
-                        )
-                        break
-        return {"detail": "已删除"}
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute("DELETE FROM user_jx3ids WHERE email=? AND jx3_uid=?", (session_user, jx3_uid))
+            conn.commit()
+            return {"detail": "已删除"}
+        finally:
+            conn.close()
     except Exception as e:
+        print(f"DEBUG: 删除UID接口报错 {e}")
         return {"detail": f"删除失败: {str(e)}"}
 
 
 # ---- 可复用渲染函数：根据完成数据重新生成完整 HTML ----
-def build_dashboard_html(short_ids, user_completed_map, display_names=None):
+# (此部分完全保留你原本的 UI 和 DOM 组装逻辑，不作任何改动)
+def build_dashboard_html(short_ids, user_completed_map, display_names=None, events_data=None):
     """阶段二~四：读取本地 JSON → 统计进度 → 组装前端 HTML"""
     import hashlib as _hashlib
     dn = display_names or {}
+    import json as _json
+    ev_data_json = _json.dumps(events_data or {}, ensure_ascii=False)
 
     # ---- 阶段二：读取本地数据库 ----
     LOCAL_GZ_FILE = os.path.join(BASE_DIR, "jx3_all_backup.json.gz")
@@ -481,9 +502,36 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
             level_val = post_data.get("level", "无")
             content = post_data.get("content") or ""
 
-            tr_data_attrs = f"data-scene='{scene}' data-layer='{layer}' data-level='{level_val}' "
+            # --- 重新拼装每行的数据属性 ---
+            subs_list = ach.get("SubAchievementList") or ach.get("SubAchievements") or []
+            sub_names = []  # 用于全局搜索的全部子成就
+            uncompleted_sub_names = []  # 仅存未完成的子成就，用于雷达精准高亮
+
+            if isinstance(subs_list, list):
+                for sub in subs_list:
+                    sub_id = sub.get("ID")
+                    s_name = sub.get("ShortDesc") or sub.get("Name") or sub.get("name") or str(sub_id)
+                    if s_name:
+                        sub_names.append(s_name)
+
+                        # 判断这个具体的子成就是否有任何账号未完成
+                        is_all_done = True
+                        for sid in short_ids:
+                            if not (sub_id and int(sub_id) in user_completed_map[sid]):
+                                is_all_done = False
+                                break
+                        # 只有真的没人做过这个具体小事件，才把它塞进未完成池子
+                        if not is_all_done:
+                            uncompleted_sub_names.append(s_name)
+
+            sub_names_str = ",".join(sub_names)
+            uncompleted_subs_str = ",".join(uncompleted_sub_names)
+
+            # 独立新增 data-uncompleted-subs 属性专供雷达读取
+            tr_data_attrs = f"data-scene='{scene}' data-layer='{layer}' data-level='{level_val}' data-subs='{sub_names_str}' data-uncompleted-subs='{uncompleted_subs_str}' "
             td_status_html = ""
 
+            # 1. 状态列恢复纯粹与紧凑
             for sid in short_ids:
                 is_completed = ach_id in user_completed_map[sid]
                 status_val = "yes" if is_completed else "no"
@@ -491,15 +539,65 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
                 if is_completed:
                     stats[m1]["users"][sid] += 1
                     stats[m1]["subs"][m2]["users"][sid] += 1
-                    td_status_html += f"<td><button class='badge badge-status badge-status-yes' data-uid='{sid}' data-val='yes'>✅ {dn.get(sid, sid)}已完</button></td>"
+                    td_status_html += f"<td><button class='badge badge-status badge-status-yes' data-uid='{sid}' data-val='yes'>✅ 完</button></td>"
                 else:
-                    td_status_html += f"<td><button class='badge badge-status badge-status-no' data-uid='{sid}' data-val='no'>❌ {dn.get(sid, sid)}未完</button></td>"
+                    td_status_html += f"<td><button class='badge badge-status badge-status-no' data-uid='{sid}' data-val='no'>❌ 未</button></td>"
+
+            # 2. 精细化排版：在后端对子成就进行多账号合并及优化过滤（防止大量子成就撑爆表格）
+            subs_html = ""
+            if subs_list and isinstance(subs_list, list):
+                subs_html += "<div class='sub-items-box'>"
+                parsed_subs = []
+                for sub in subs_list:
+                    sub_id = sub.get("ID")
+                    sub_name = sub.get("ShortDesc") or sub.get("Name") or str(sub_id)
+
+                    sub_status = {}
+                    is_all_done = True
+                    for sid in short_ids:
+                        done = sub_id and int(sub_id) in user_completed_map[sid]
+                        sub_status[sid] = done
+                        if not done: is_all_done = False
+
+                    parsed_subs.append({
+                        "id": sub_id, "name": sub_name, "status": sub_status, "is_all_done": is_all_done
+                    })
+
+                # 核心约束：优先把未在所有账号全部完成的子成就排在前面
+                parsed_subs.sort(key=lambda x: x["is_all_done"])
+
+                # 核心约束：最多只展示前6个，防止排版错乱
+                max_show = 6
+                show_subs = parsed_subs[:max_show]
+                has_more = len(parsed_subs) > max_show
+
+                for ps in show_subs:
+                    dots = ""
+                    for sid in short_ids:
+                        color = "#10b981" if ps["status"][sid] else "#ef4444"
+                        completed_text = "已完成" if ps["status"][sid] else "未完成"
+                        dots += f"<span class='sub-status-dot' style='background:{color}' title='{dn.get(sid, sid)}: {completed_text}'></span>"
+
+                    style_class = "sub-item-all-done" if ps["is_all_done"] else "sub-item-not-done"
+                    subs_html += f"<div class='sub-item-row {style_class}' data-id='{ps['id']}'>" \
+                                 f"<span class='sub-item-name'>• {ps['name']}</span>" \
+                                 f"<span class='sub-item-dots'>{dots}</span>" \
+                                 f"</div>"
+                if has_more:
+                    remain_not_done = sum(1 for x in parsed_subs[max_show:] if not x["is_all_done"])
+                    if remain_not_done > 0:
+                        subs_html += f"<div class='sub-item-more'>还有 {remain_not_done} 项未完成...</div>"
+                    else:
+                        subs_html += f"<div class='sub-item-more'>其余均已完成</div>"
+                subs_html += "</div>"
 
             scene_html = f"<button class='badge badge-scene' data-val='{scene}'>{scene}</button>" if scene != "无" else "-"
             layer_html = f"<button class='badge badge-layer' data-val='{layer}'>{layer}</button>" if layer != "无" else "-"
-            level_html = f"<button class='badge badge-level' data-val='{level_val}'>{level_val}</button>" if str(level_val) != "无" else "-"
-            guide_html = f"""<details><summary>💡 查看攻略详情</summary><div class="guide-content">{content}</div></details>""" if content.strip() else ""
+            level_html = f"<button class='badge badge-level' data-val='{level_val}'>{level_val}</button>" if str(
+                level_val) != "无" else "-"
+            guide_html = f"""<details><summary>💡 展开攻略详情</summary><div class="guide-content">{content}</div></details>""" if content.strip() else ""
 
+            # 将原本在状态列下面的子成就，重构塞进"成就信息"列（即包含名和ID的一列）
             html_templates[template_id] += f"""
             <tr {tr_data_attrs}>
                 {td_status_html}
@@ -509,6 +607,7 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
                 <td>
                     <div class="ach-title">{ach.get("Name", "未知")}</div>
                     <div class="ach-id">ID: {ach_id}</div>
+                    {subs_html}
                 </td>
                 <td><div>{ach.get("ShortDesc", "")}</div>{guide_html}</td>
                 <td>{ach.get("Point", 0)}</td>
@@ -575,6 +674,35 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
             :root {{ --bg: #f8fafc; --card: #ffffff; --border: #e2e8f0; --text: #334155; --primary: #475569; }}
             body {{ font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; line-height: 1.6;}}
             h1 {{ text-align: center; color: #1e293b; margin-bottom: 30px; }}
+            /* 布局核心：左看板，右雷达 */
+            .main-layout {{ display: flex; gap: 20px; align-items: flex-start; }}
+            .left-board {{ flex: 1; min-width: 0; }}
+            .right-radar {{ width: 280px; flex-shrink: 0; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); position: sticky; top: 20px; max-height: calc(100vh - 40px); overflow-y: auto; }}
+            .radar-title {{ font-size: 16px; font-weight: bold; color: #1e293b; margin-top: 0; border-bottom: 2px dashed var(--border); padding-bottom: 10px; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }}
+            /* 雷达内部事件卡片 */
+            .radar-group {{ margin-bottom: 15px; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; }}
+            /* 子成就精细化排版框 */
+            .sub-items-box {{ margin-top: 8px; padding: 6px 10px; background: #f8fafc; border-radius: 6px; border: 1px dashed #e2e8f0; max-width: 100%; }}
+            .sub-item-row {{ display: flex; align-items: center; justify-content: space-between; font-size: 12px; padding: 2px 0; border-bottom: 1px dashed #f1f5f9; }}
+            .sub-item-row:last-child {{ border-bottom: none; }}
+            .sub-item-name {{ color: #475569; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }}
+            .sub-item-all-done .sub-item-name {{ color: #94a3b8; text-decoration: line-through; }}
+            /* 多账号状态小圆点并排 */
+            .sub-item-dots {{ display: flex; gap: 4px; align-items: center; }}
+            .sub-status-dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; cursor: help; }}
+            .sub-item-more {{ font-size: 11px; color: #f59e0b; margin-top: 4px; font-weight: bold; text-align: center; }}
+
+            /* 雷达折叠样式 */
+            .radar-group-title {{ background: #f1f5f9; padding: 8px 12px; font-size: 13px; font-weight: bold; color: #3b82f6; cursor: pointer; display: flex; justify-content: space-between; align-items: center; user-select: none; }}
+            .radar-group-title::after {{ content: '▼'; font-size: 10px; color: #94a3b8; transition: transform 0.2s; }}
+            .radar-group.expanded .radar-group-title::after {{ transform: rotate(180deg); }}
+            .radar-items-container {{ display: none; }}
+            .radar-group.expanded .radar-items-container {{ display: block; }}
+            @keyframes blink {{ 50% {{ opacity: 0.4; }} }}
+            .radar-item {{ padding: 8px 12px; border-top: 1px solid #f1f5f9; cursor: pointer; transition: background 0.2s; }}
+            .radar-item:hover {{ background: #eff6ff; }}
+            .radar-item-stage {{ font-size: 13px; font-weight: bold; color: #1e293b; }}
+            .radar-item-time {{ font-size: 11px; color: #64748b; margin-top: 4px; }}
             .m1-group {{ margin-bottom: 15px; }}
             .menu-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; cursor: pointer; transition: all 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
             .menu-card:hover {{ box-shadow: 0 4px 12px rgba(0,0,0,0.1); transform: translateY(-2px); border-color: #cbd5e1; }}
@@ -624,59 +752,44 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
     </head>
     <body>
         <h1>🏆 剑网3 多角色成就看板</h1>
-        <div class="global-search-bar"><input type="text" id="global-search" class="global-search-input" placeholder="🔍 全局搜索成就名或场景名（如"战宝军械库"）..."></div>
-        <div id="view-menus">{dashboard_html}</div>
-        <div id="view-table">
-            <div class="table-header-bar">
-                <button class="btn-back" onclick="closeTable()">🔙 返回看板</button>
-                <h2 id="current-table-title" style="margin:0; color:#334155;">-</h2>
-                <div style="width: 100px;"></div>
-            </div>
-            <div class="filter-bar">
-                {status_filters_html}
-                <div class="filter-group">
-                    <label>场景:</label>
-                    <div class="select-wrapper">
-                        <select id="filter-scene" class="filter-select"><option value="all">全部</option></select>
-                        <button class="clear-single" data-target="filter-scene">✖</button>
+        <div class="main-layout">
+            <div class="left-board">
+                <div class="global-search-bar"><input type="text" id="global-search" class="global-search-input" placeholder="🔍 全局搜索成就名、事件名或场景（如'战宝军械库'）..."></div>
+                <div id="view-menus">{dashboard_html}</div>
+                <div id="view-table">
+                    <div class="table-header-bar">
+                        <button class="btn-back" onclick="closeTable()">🔙 返回看板</button>
+                        <h2 id="current-table-title" style="margin:0; color:#334155;">-</h2>
+                        <div style="width: 100px;"></div>
                     </div>
-                </div>
-                <div class="filter-group">
-                    <label>层级:</label>
-                    <div class="select-wrapper">
-                        <select id="filter-layer" class="filter-select"><option value="all">全部</option></select>
-                        <button class="clear-single" data-target="filter-layer">✖</button>
+                    <div class="filter-bar">
+                        {status_filters_html}
+                        <div class="filter-group"><label>场景:</label><div class="select-wrapper"><select id="filter-scene" class="filter-select"><option value="all">全部</option></select><button class="clear-single" data-target="filter-scene">✖</button></div></div>
+                        <div class="filter-group"><label>层级:</label><div class="select-wrapper"><select id="filter-layer" class="filter-select"><option value="all">全部</option></select><button class="clear-single" data-target="filter-layer">✖</button></div></div>
+                        <div class="filter-group"><label>难度:</label><div class="select-wrapper"><select id="filter-level" class="filter-select"><option value="all">全部</option></select><button class="clear-single" data-target="filter-level">✖</button></div></div>
+                        <div class="filter-group" style="margin-left: auto;"><input type="text" id="filter-search" class="filter-search-input" placeholder="🔍 搜索成就名或ID..."></div>
                     </div>
-                </div>
-                <div class="filter-group">
-                    <label>难度:</label>
-                    <div class="select-wrapper">
-                        <select id="filter-level" class="filter-select"><option value="all">全部</option></select>
-                        <button class="clear-single" data-target="filter-level">✖</button>
-                    </div>
-                </div>
-                <div class="filter-group" style="margin-left: auto;">
-                    <input type="text" id="filter-search" class="filter-search-input" placeholder="🔍 搜索成就名或ID...">
+                    <table>
+                        <thead>
+                            <tr>
+                                {status_th_html}
+                                <th width="100px">场景</th><th width="100px">层级</th><th width="60px">难度</th><th width="200px">成就信息</th><th>达成条件 & 攻略</th><th width="60px">资历</th>
+                            </tr>
+                        </thead>
+                        <tbody id="table-body"></tbody>
+                    </table>
                 </div>
             </div>
-            <table>
-                <thead>
-                    <tr>
-                        {status_th_html}
-                        <th width="100px">场景</th>
-                        <th width="100px">层级</th>
-                        <th width="60px">难度</th>
-                        <th width="200px">成就信息</th>
-                        <th>达成条件 & 攻略</th>
-                        <th width="60px">资历</th>
-                    </tr>
-                </thead>
-                <tbody id="table-body"></tbody>
-            </table>
+
+            <div class="right-radar">
+                <h3 class="radar-title">📡 实时事件雷达</h3>
+                <div id="radar-content"><div style="color:#94a3b8; font-size:13px; text-align:center;">正在解析数据...</div></div>
+            </div>
         </div>
         <div id="templates-pool" style="display:none;">{templates_html}</div>
         <script>
             const userIds = {json.dumps(short_ids)};
+            const mapEventsData = {ev_data_json};
             let currentRows = [];
             function toggleSubs(subsId) {{
                 const el = document.getElementById(subsId);
@@ -804,7 +917,9 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
                             const scene = tr.dataset.scene || '';
                             const achTitle = tr.querySelector('.ach-title');
                             const title = achTitle ? achTitle.innerText : '';
-                            if (scene === keyword || title.includes(keyword)) {{
+                            const subs = tr.dataset.subs || ''; // 新增：读取隐藏的子成就数据
+                            // 新增：只要场景、标题或任何子成就名字包含关键字，就判定为匹配
+                            if (scene === keyword || title.includes(keyword) || subs.includes(keyword)) {{
                                 matchedRows.push(tr.cloneNode(true));
                             }}
                         }});
@@ -839,7 +954,197 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
                     applyFilters();
                 }});
             }}
-            document.addEventListener('DOMContentLoaded', initGlobalSearch);
+            function renderRadar() {{
+                const container = document.getElementById('radar-content');
+                if (!mapEventsData || Object.keys(mapEventsData).length === 0) {{
+                    container.innerHTML = '<div style="color:#ef4444; font-size:13px; text-align:center;">暂无地图事件数据</div>';
+                    return;
+                }}
+
+                // 【核心修复 2】：前端只抓取后端精确算好的 uncompletedSubs 属性，不再被父成就误导
+                const uncompletedSubsSet = new Set();
+                document.querySelectorAll('#templates-pool template').forEach(tpl => {{
+                    tpl.content.querySelectorAll('tr').forEach(tr => {{
+                        if (tr.dataset.uncompletedSubs) {{
+                            tr.dataset.uncompletedSubs.split(',').forEach(s => {{
+                                if (s.trim()) uncompletedSubsSet.add(s.trim());
+                            }});
+                        }}
+                    }});
+                }});
+
+                const expandedStates = {{}};
+                document.querySelectorAll('.radar-group').forEach(el => {{
+                    expandedStates[el.id] = el.classList.contains('expanded');
+                }});
+
+                const now = new Date();
+                const bjtTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + (8 * 3600000));
+                const currentH = bjtTime.getHours();
+                const currentM = bjtTime.getMinutes();
+                const currentTotalM = currentH * 60 + currentM;
+
+                let html = '';
+                const targetOrder = ["穹野卫", "披风会", "云从社", "楚天社"];
+                const sortedFactions = Object.keys(mapEventsData).sort((a, b) => {{
+                    let idxA = targetOrder.indexOf(a), idxB = targetOrder.indexOf(b);
+                    return (idxA === -1 ? 999 : idxA) - (idxB === -1 ? 999 : idxB);
+                }});
+                for (const faction of sortedFactions) {{
+                    const events = mapEventsData[faction];
+                    if (!events || !Array.isArray(events) || events.length === 0) continue;
+
+                    let cycleLength = 2; 
+                    if (faction.includes("穹野卫") || faction.includes("披风会") || faction.includes("伊丽川")) {{
+                        cycleLength = 3;
+                    }}
+
+                    let groupHighlight = false; 
+                    const processedEvents = [];
+
+                    events.forEach(ev => {{
+                        let evHour = parseInt(ev.hour);
+
+                        // 【核心修复】：银霜口(云从社)特殊判定，通过 key 强制绑定奇偶轨道
+                        // y0 强制为偶数轨(0), y1 强制为奇数轨(1)
+                        if (faction.includes("云从社") || (ev.map && (ev.map.includes("银霜") || ev.map.includes("银双")))) {{
+                            if (ev.key === "y0") evHour = 0;
+                            if (ev.key === "y1") evHour = 1;
+                            cycleLength = 2; // 确保云从社严格遵守2小时双轨
+                        }}
+
+                        // 【核心修复】：楚天社特殊判定，无视API残缺数据，通过地图严格绑定奇偶轨道
+                        if (faction.includes("楚天社")) {{
+                            if (ev.map && (ev.map.includes("烂柯山") || ev.map.includes("晟江"))) {{
+                                evHour = 0; // 偶数点轨道
+                            }}
+                            if (ev.map && (ev.map.includes("百溪") || ev.map.includes("楚州"))) {{
+                                evHour = 1; // 奇数点轨道
+                            }}
+                            cycleLength = 2; // 确保双轨循环
+                        }}
+
+                        if (isNaN(evHour)) return; 
+
+                        let targetH = currentH;
+                        let loopGuard = 0;
+                        while ((targetH % cycleLength) != evHour && loopGuard < 24) {{
+                            targetH++;
+                            loopGuard++;
+                        }}
+
+                        let targetTotalM = targetH * 60 + parseInt(ev.time || 0);
+                        let diff = targetTotalM - currentTotalM;
+
+                        if (diff < -15) {{
+                            targetH += cycleLength;
+                            targetTotalM += cycleLength * 60;
+                            diff = targetTotalM - currentTotalM;
+                        }}
+
+                        let displayH = targetH % 24;
+
+                        let status = 0; 
+                        if (diff <= 0 && diff >= -5) status = 1; 
+                        else if (diff < -5) status = -1; 
+
+                        const isAssociatedWithNotDone = uncompletedSubsSet.has(ev.stage);
+
+                        // 【核心修复 1】：将"有需求"的判定加上严格的时间锁 (30分钟以内才算)
+                        const isNeededAndUpcoming = isAssociatedWithNotDone && diff <= 30 && status !== -1;
+
+                        if (isNeededAndUpcoming) {{
+                            groupHighlight = true;
+                        }}
+
+                        const timeStr = String(displayH).padStart(2, '0') + ':' + String(parseInt(ev.time || 0)).padStart(2, '0');
+                        processedEvents.push({{ ...ev, timeStr, diff, status, isAssociatedWithNotDone, isNeededAndUpcoming }});
+                    }});
+
+                    processedEvents.sort((a, b) => {{
+                        if (a.status === -1 && b.status !== -1) return 1;
+                        if (a.status !== -1 && b.status === -1) return -1;
+
+                        // 【排序修复】：只有同时满足"未完成"且"30分钟以内"，才有资格置顶
+                        if (a.isNeededAndUpcoming && !b.isNeededAndUpcoming) return -1;
+                        if (!a.isNeededAndUpcoming && b.isNeededAndUpcoming) return 1;
+
+                        return a.diff - b.diff;
+                    }});
+
+                    const groupTitleStyle = groupHighlight ? 'background: #fefce8; color: #d97706; animation: blink 2s infinite;' : '';
+                    const expandedClass = expandedStates[`radar-g-${{faction}}`] ? 'expanded' : '';
+
+                    html += `<div class="radar-group ${{expandedClass}}" id="radar-g-${{faction}}">
+                                <div class="radar-group-title" style="${{groupTitleStyle}}" onclick="document.getElementById('radar-g-${{faction}}').classList.toggle('expanded')">
+                                    ${{faction}} ${{groupHighlight ? '🔥 有需求' : ''}}
+                                </div>
+                                <div class="radar-items-container">`;
+
+                    processedEvents.forEach(ev => {{
+                        let colorStyle = '';
+                        let statusTag = '';
+
+                        const isUpcomingWithin10 = (ev.status === 0 && ev.diff > 0 && ev.diff <= 10);
+
+                        if (ev.status === 1) {{
+                            if (ev.isNeededAndUpcoming) {{
+                                colorStyle = 'background: #fefce8; border-left: 3px solid #f59e0b; font-weight: bold;';
+                                statusTag = '<span style="font-size:10px; color:#d97706; margin-left:6px; animation: blink 1.5s infinite;">🔥 正在进行</span>';
+                            }} else {{
+                                colorStyle = 'background: #f8fafc; border-left: 3px solid #cbd5e1;';
+                                statusTag = '<span style="font-size:10px; color:#64748b; margin-left:6px;">🟢 正在进行(成就已拿)</span>';
+                            }}
+                        }} else if (isUpcomingWithin10) {{
+                            // 10分钟内，强制套用无需求的进行中格式（灰底、灰字、绿点）
+                            colorStyle = 'background: #f8fafc; border-left: 3px solid #cbd5e1;';
+                            if (ev.isNeededAndUpcoming) {{
+                                statusTag = `<span style="font-size:10px; color:#64748b; margin-left:6px; font-weight:bold;">🟢 ${{ev.diff}}分钟后(有需求)</span>`;
+                            }} else {{
+                                statusTag = `<span style="font-size:10px; color:#64748b; margin-left:6px;">🟢 ${{ev.diff}}分钟后</span>`;
+                            }}
+                        }} else if (ev.status === -1) {{
+                            colorStyle = 'opacity: 0.5; filter: grayscale(1); background: #f1f5f9;';
+                            statusTag = '<span style="font-size:10px; color:#94a3b8; margin-left:6px;">🏁 已结束</span>';
+                        }} else {{
+                            if (ev.isNeededAndUpcoming) {{
+                                colorStyle = 'background: #f0f9ff; border-left: 3px solid #0284c7; font-weight: bold;';
+                                statusTag = `<span style="font-size:10px; color:#0284c7; margin-left:6px;">⏳ ${{ev.diff}}分钟后</span>`;
+                            }} else {{
+                                colorStyle = 'opacity: 0.6; filter: grayscale(1);';
+                                statusTag = `<span style="font-size:10px; color:#94a3b8; margin-left:6px;">⏳ ${{ev.diff}}分钟后</span>`;
+                            }}
+                        }}
+
+                        const mapNameHtml = ev.map ? `<span style="color:#0284c7; font-weight:bold; margin-right:4px;">[${{ev.map}}]</span>` : '';
+
+                        html += `<div class="radar-item" style="${{colorStyle}}" onclick="triggerRadarSearch('${{ev.stage}}')" title="${{ev.desc}}">
+                                    <div class="radar-item-stage">${{mapNameHtml}}🎯 ${{ev.stage}} <span style="font-size:11px;color:#94a3b8;font-weight:normal;">(${{ev.site || '未知'}})</span></div>
+                                    <div class="radar-item-time">⏱ ${{ev.timeStr}} ${{statusTag}}</div>
+                                 </div>`;
+                    }});
+                    html += `</div></div>`;
+                }}
+                container.innerHTML = html;
+            }}
+
+            function triggerRadarSearch(keyword) {{
+                const input = document.getElementById('global-search');
+                if (input) {{
+                    input.value = keyword;
+                    // 派发 input 事件，触发原有的 initGlobalSearch 逻辑
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    // 滚动到顶部，方便看搜索结果
+                    window.scrollTo({{ top: 0, behavior: 'smooth' }});
+                }}
+            }}
+
+            document.addEventListener('DOMContentLoaded', () => {{
+                initGlobalSearch();
+                renderRadar();
+                // 每隔 30 秒自动刷新一次雷达倒计时
+                setInterval(renderRadar, 30000);
+            }});
         </script>
     </body>
     </html>
@@ -847,7 +1152,10 @@ def build_dashboard_html(short_ids, user_completed_map, display_names=None):
     return final_html
 
 
+# ==========================================
 # 核心处理接口：接收表单数据，返回完整单页应用 HTML
+# (完全重构为 SQLite)
+# ==========================================
 @app.post("/generate", response_class=HTMLResponse)
 async def generate_dashboard(request: Request, jx3ids: str = Form(...)):
     try:
@@ -861,20 +1169,16 @@ async def generate_dashboard(request: Request, jx3ids: str = Form(...)):
         remarks_map = {}
         if session_user:
             try:
-                r = requests.get(
-                    f"{TCB_JX3IDS_URL}/documents",
-                    params={"where": json.dumps({"email": session_user}), "limit": 100},
-                    headers=TCB_HEADERS, timeout=8
-                )
-                if r.status_code == 200:
-                    body_r = r.json()
-                    docs = body_r.get("list") or body_r.get("data") or []
-                    if isinstance(docs, list):
-                        for d in docs:
-                            if d.get("email") == session_user:
-                                remarks_map[d.get("jx3_uid", "")] = d.get("alias_name", "")
-            except Exception:
-                pass
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                try:
+                    cur = conn.execute("SELECT jx3_uid, alias_name FROM user_jx3ids WHERE email=?", (session_user,))
+                    for r in cur.fetchall():
+                        remarks_map[r["jx3_uid"]] = r["alias_name"]
+                finally:
+                    conn.close()
+            except Exception as e:
+                print(f"DEBUG: 获取备注报错 {e}")
 
         short_ids = [uid[-4:] if len(uid) >= 4 else uid for uid in jx3id_list]
 
@@ -887,16 +1191,19 @@ async def generate_dashboard(request: Request, jx3ids: str = Form(...)):
             else:
                 display_names[sid] = sid
 
-        # ---- 静默日志：记录查询请求（不影响主流程） ----
+        # ---- 静默日志：记录查询请求（存入 sqlite） ----
         try:
-            requests.post(
-                TCB_QUERY_LOGS_URL + "/documents",
-                json={"data": [{"query_uids": jx3ids, "created_at": int(time.time())}]},
-                headers=TCB_HEADERS,
-                timeout=1.5,
-            )
-        except Exception:
-            pass
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                conn.execute(
+                    "INSERT INTO query_logs (query_uids, created_at) VALUES (?, ?)",
+                    (jx3ids, int(time.time()))
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"DEBUG: 写入查询日志失败 {e}")
 
         # ---------------- 阶段一：获取API数据 ----------------
         user_completed_map = {}
@@ -905,6 +1212,7 @@ async def generate_dashboard(request: Request, jx3ids: str = Form(...)):
             sid = short_ids[index]
             api_url = f"https://next2.jx3box.com/api/next2/user-achievements?jx3id={full_id}"
             try:
+                print(f"DEBUG: 正在拉取魔盒API，UID={full_id}")
                 resp = requests.get(api_url, headers=headers, timeout=30)
             except requests.exceptions.Timeout:
                 return f"<h3>请求账号 {full_id} 超时（服务器位于境外，跨网访问剑三API较慢，请稍后重试）。</h3>"
@@ -922,75 +1230,55 @@ async def generate_dashboard(request: Request, jx3ids: str = Form(...)):
             user_completed_map[sid] = completed
 
         # ---- 调用可复用渲染函数 ----
-        final_html = build_dashboard_html(short_ids, user_completed_map, display_names)
+        events_data = await fetch_all_events()
+        final_html = build_dashboard_html(short_ids, user_completed_map, display_names, events_data)
 
-        # ---- 写入 CloudBase 缓存（仅存储 raw_data） ----
-        if TCB_ENV_ID and TCB_API_KEY:
+        # ---- 写入 SQLite 缓存（仅存储 raw_data） ----
+        try:
+            doc_id = uuid.uuid4().hex
+            raw_data = {
+                "jx3ids": jx3ids,
+                "user_completed_map": {k: list(v) for k, v in user_completed_map.items()},
+                "short_ids": short_ids,
+            }
+            raw_data_str = json.dumps(raw_data, ensure_ascii=False)
+
+            conn = sqlite3.connect(DB_PATH)
             try:
-                raw_data = {
-                    "jx3ids": jx3ids,
-                    "user_completed_map": {k: list(v) for k, v in user_completed_map.items()},
-                    "short_ids": short_ids,
-                }
-                payload = {"data": [{"raw_data": raw_data, "created_at": int(time.time())}]}
-                print(f"DEBUG TCB URL: {TCB_COLLECTION_URL}/documents")
-                resp = requests.post(f"{TCB_COLLECTION_URL}/documents", json=payload, headers=TCB_HEADERS, timeout=15)
-                print(f"DEBUG TCB STATUS: {resp.status_code}")
-                print(f"DEBUG TCB RESPONSE: {resp.text[:300]}")
-                if resp.status_code in (200, 201):
-                    body = resp.json()
-                    doc_id = None
+                conn.execute(
+                    "INSERT INTO html_cache (id, raw_data, created_at) VALUES (?, ?, ?)",
+                    (doc_id, raw_data_str, int(time.time()))
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
-                    # 精准解析腾讯云返回的 insertedIds 数组
-                    if "insertedIds" in body and isinstance(body["insertedIds"], list) and body["insertedIds"]:
-                        doc_id = body["insertedIds"][0]
-                    else:
-                        # 兜底兼容
-                        doc_id = body.get("id") or body.get("_id")
-
-                    if doc_id:
-                        print(f"DEBUG TCB DOC_ID: {doc_id}")
-                        return RedirectResponse(f"/board/{doc_id}", status_code=303)
-            except Exception as e:
-                print(f"DEBUG TCB EXCEPTION: {repr(e)}")
+            print(f"DEBUG: 缓存已存入本地 DB，doc_id: {doc_id}")
+            return RedirectResponse(f"/board/{doc_id}", status_code=303)
+        except Exception as e:
+            print(f"DEBUG DB EXCEPTION: {repr(e)}")
 
         return final_html
 
     except Exception as e:
+        print(f"DEBUG: Generate 阶段报错 {e}")
         return f"<h3>处理出错：{str(e)}</h3>"
 
 
 @app.get("/board/{doc_id}", response_class=HTMLResponse)
 async def view_board(request: Request, doc_id: str):
-    """从 CloudBase 读取 raw_data，实时重建看板"""
-    if not TCB_ENV_ID or not TCB_API_KEY:
-        return HTMLResponse("<h3>数据库未配置（缺少 TCB_ENV_ID 或 TCB_API_KEY 环境变量）。</h3>", status_code=500)
+    """从本地 SQLite 读取 raw_data，实时重建看板"""
     try:
-        # 直接获取文档
-        resp = requests.get(f"{TCB_COLLECTION_URL}/documents/{doc_id}", headers=TCB_HEADERS, timeout=10)
-        print(f"DEBUG GET STATUS: {resp.status_code}")
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
         raw_data = None
-        if resp.status_code == 200:
-            body = resp.json()
-            doc = body.get("data") or body.get("list") or body
-            if isinstance(doc, dict) and "raw_data" in doc:
-                raw_data = doc.get("raw_data")
-            elif isinstance(doc, list) and len(doc) > 0:
-                raw_data = doc[0].get("raw_data")
-
-        # 回退：where 查询
-        if raw_data is None:
-            resp2 = requests.get(
-                f"{TCB_COLLECTION_URL}/documents",
-                params={"where": json.dumps({"_id": doc_id})},
-                headers=TCB_HEADERS,
-                timeout=10
-            )
-            if resp2.status_code == 200:
-                body2 = resp2.json()
-                docs = body2.get("list") or body2.get("data")
-                if isinstance(docs, list) and len(docs) > 0:
-                    raw_data = docs[0].get("raw_data")
+        try:
+            cur = conn.execute("SELECT raw_data FROM html_cache WHERE id=?", (doc_id,))
+            row = cur.fetchone()
+            if row:
+                raw_data = json.loads(row["raw_data"])
+        finally:
+            conn.close()
 
         if not raw_data or not isinstance(raw_data, dict):
             return HTMLResponse("<h3>看板已过期、不存在或数据库连接失败。</h3>", status_code=404)
@@ -1002,23 +1290,19 @@ async def view_board(request: Request, doc_id: str):
         remarks_map = {}
         if session_user:
             try:
-                r = requests.get(
-                    f"{TCB_JX3IDS_URL}/documents",
-                    params={"where": json.dumps({"email": session_user}), "limit": 100},
-                    headers=TCB_HEADERS, timeout=8
-                )
-                if r.status_code == 200:
-                    body_r = r.json()
-                    docs = body_r.get("list") or body_r.get("data") or []
-                    if isinstance(docs, list):
-                        for d in docs:
-                            if d.get("email") == session_user:
-                                remarks_map[d.get("jx3_uid", "")] = d.get("alias_name", "")
-            except Exception:
-                pass
+                conn2 = sqlite3.connect(DB_PATH)
+                conn2.row_factory = sqlite3.Row
+                try:
+                    cur = conn2.execute("SELECT jx3_uid, alias_name FROM user_jx3ids WHERE email=?", (session_user,))
+                    for r in cur.fetchall():
+                        remarks_map[r["jx3_uid"]] = r["alias_name"]
+                finally:
+                    conn2.close()
+            except Exception as e:
+                print(f"DEBUG: Board读取备注报错 {e}")
         # ==========================================
 
-        # 重建 set 并重新渲染，注意清洗腾讯云的 EJSON 格式
+        # 重建 set 并重新渲染，注意清洗腾讯云可能残留的 EJSON 格式（兼容旧数据导入）
         short_ids_recv = raw_data.get("short_ids", [])
         raw_map = raw_data.get("user_completed_map", {})
 
@@ -1046,8 +1330,12 @@ async def view_board(request: Request, doc_id: str):
                 sid = short_ids_recv[i]
                 display_names[sid] = f"[{remarks_map[full_id]}]" if full_id in remarks_map else sid
 
-        # 最后，带上 display_names 参数调用渲染器
-        final_html = build_dashboard_html(short_ids_recv, user_completed_map, display_names)
+        # 🔥 修复点：在跳转后的看板页面，重新拉取一次实时的地图事件
+        real_events_data = await fetch_all_events()
+
+        # 最后，带上 display_names 和实时的 events_data 参数调用渲染器
+        final_html = build_dashboard_html(short_ids_recv, user_completed_map, display_names,
+                                          events_data=real_events_data)
         return HTMLResponse(final_html)
 
     except Exception as e:
@@ -1068,33 +1356,22 @@ async def admin_logs(request: Request):
 
     rows_html = ""
     try:
-        resp = requests.get(
-            f"{TCB_QUERY_LOGS_URL}/documents",
-            params={"limit": 100},
-            headers=TCB_HEADERS,
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            body = resp.json()
-            docs = body.get("list") or body.get("data") or []
-            if isinstance(docs, list) and docs:
-                # 修复核心：清洗腾讯云的 EJSON 时间戳
-                def get_ts(d):
-                    val = d.get("created_at", 0)
-                    if isinstance(val, dict):
-                        return int(val.get("$numberInt") or val.get("$numberLong") or 0)
-                    return int(val) if val else 0
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.execute("SELECT query_uids, created_at FROM query_logs ORDER BY created_at DESC LIMIT 100")
+            rows = cur.fetchall()
 
-                # Python 侧时间倒序排列
-                docs.sort(key=get_ts, reverse=True)
-                for d in docs:
-                    ts = get_ts(d)
+            if rows:
+                for d in rows:
+                    ts = d["created_at"]
                     time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "-"
-                    uids = d.get("query_uids", "-")
+                    uids = d["query_uids"] or "-"
                     rows_html += f"<tr><td style='white-space:nowrap;'>{time_str}</td><td>{uids}</td></tr>"
-        else:
-            rows_html = f"<tr><td colspan='2' style='color:#ef4444;'>API 请求失败: {resp.status_code}</td></tr>"
+        finally:
+            conn.close()
     except Exception as e:
+        print(f"DEBUG: 读取日志报错 {e}")
         rows_html = f"<tr><td colspan='2' style='color:#ef4444;'>读取日志失败: {str(e)}</td></tr>"
 
     if not rows_html:

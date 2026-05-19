@@ -1,4 +1,5 @@
-fastapi
+﻿fastapi
 python-multipart
 uvicorn
 requests
+httpx
