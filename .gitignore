@@ -35,6 +35,11 @@ tcb_backup.json
 *.swo
 *~
 
+# === 项目文档（仅本地保留） ===
+后续开发文档.md
+项目文档.md
+项目目录结构.md
+
 # === 系统文件 ===
 .DS_Store
 Thumbs.db
