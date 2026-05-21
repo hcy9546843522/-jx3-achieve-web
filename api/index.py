@@ -55,10 +55,16 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS query_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT,
             query_uids TEXT NOT NULL,
             created_at INTEGER NOT NULL
         )
     ''')
+    # 兼容已有数据库：为旧表追加 email 列
+    try:
+        cursor.execute("ALTER TABLE query_logs ADD COLUMN email TEXT")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
     conn.commit()
     conn.close()
     print(f"DEBUG: 数据库初始化完成，路径: {DB_PATH}")
@@ -1195,9 +1201,10 @@ async def generate_dashboard(request: Request, jx3ids: str = Form(...)):
         try:
             conn = sqlite3.connect(DB_PATH)
             try:
+                operator = session_user if session_user else "游客(Guest)"
                 conn.execute(
-                    "INSERT INTO query_logs (query_uids, created_at) VALUES (?, ?)",
-                    (jx3ids, int(time.time()))
+                    "INSERT INTO query_logs (email, query_uids, created_at) VALUES (?, ?, ?)",
+                    (operator, jx3ids, int(time.time()))
                 )
                 conn.commit()
             finally:
@@ -1354,56 +1361,270 @@ async def admin_logs(request: Request):
             status_code=403,
         )
 
-    rows_html = ""
+    # ---- 动态兼容：检查 email 列是否存在 ----
+    has_email = False
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         try:
-            cur = conn.execute("SELECT query_uids, created_at FROM query_logs ORDER BY created_at DESC LIMIT 100")
-            rows = cur.fetchall()
+            col_cur = conn.execute("PRAGMA table_info(query_logs)")
+            for col in col_cur.fetchall():
+                if col["name"] == "email":
+                    has_email = True
+                    break
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
+    # ---- 数据大盘卡片统计 ----
+    total_queries = 0
+    unique_users = 0
+    today_queries = 0
+    today_start = int(time.mktime(time.strptime(time.strftime("%Y-%m-%d") + " 00:00:00", "%Y-%m-%d %H:%M:%S")))
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            total_queries = conn.execute("SELECT COUNT(*) as cnt FROM query_logs").fetchone()["cnt"]
+            if has_email:
+                unique_users = conn.execute("SELECT COUNT(DISTINCT email) as cnt FROM query_logs").fetchone()["cnt"]
+            else:
+                unique_users = 0
+            today_queries = conn.execute(
+                "SELECT COUNT(*) as cnt FROM query_logs WHERE created_at >= ?", (today_start,)
+            ).fetchone()["cnt"]
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"DEBUG: 大盘统计失败 {e}")
+
+    # ---- Tab1: 用户明细（按 email 聚合） ----
+    user_detail_rows = ""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            if has_email:
+                cur = conn.execute(
+                    "SELECT email, COUNT(*) as cnt, MAX(created_at) as last_ts, GROUP_CONCAT(query_uids, ' | ') as all_uids "
+                    "FROM query_logs GROUP BY email ORDER BY cnt DESC"
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT '-' as email, COUNT(*) as cnt, MAX(created_at) as last_ts, GROUP_CONCAT(query_uids, ' | ') as all_uids "
+                    "FROM query_logs"
+                )
+            rows = cur.fetchall()
+            if rows:
+                for d in rows:
+                    email = d["email"] or "-"
+                    cnt = d["cnt"]
+                    last_ts = d["last_ts"]
+                    last_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_ts)) if last_ts else "-"
+                    all_uids = d["all_uids"] or "-"
+                    user_detail_rows += (
+                        f"<tr>"
+                        f"<td>{email}</td>"
+                        f"<td style='text-align:center;font-weight:600;'>{cnt}</td>"
+                        f"<td style='white-space:nowrap;'>{last_time}</td>"
+                        f"<td style='max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='{all_uids}'>{all_uids}</td>"
+                        f"</tr>"
+                    )
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"DEBUG: 用户明细查询失败 {e}")
+        user_detail_rows = f"<tr><td colspan='4' style='color:#ef4444;'>加载失败: {str(e)}</td></tr>"
+    if not user_detail_rows:
+        user_detail_rows = "<tr><td colspan='4' style='color:#94a3b8;'>暂无数据</td></tr>"
+
+    # ---- Tab2: 实时轨迹（最近 100 条） ----
+    trace_rows = ""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            if has_email:
+                cur = conn.execute("SELECT email, query_uids, created_at FROM query_logs ORDER BY created_at DESC LIMIT 100")
+            else:
+                cur = conn.execute("SELECT '-' as email, query_uids, created_at FROM query_logs ORDER BY created_at DESC LIMIT 100")
+            rows = cur.fetchall()
             if rows:
                 for d in rows:
                     ts = d["created_at"]
                     time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "-"
+                    email = d["email"] or "-"
                     uids = d["query_uids"] or "-"
-                    rows_html += f"<tr><td style='white-space:nowrap;'>{time_str}</td><td>{uids}</td></tr>"
+                    trace_rows += (
+                        f"<tr>"
+                        f"<td style='white-space:nowrap;'>{time_str}</td>"
+                        f"<td>{email}</td>"
+                        f"<td style='max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='{uids}'>{uids}</td>"
+                        f"</tr>"
+                    )
         finally:
             conn.close()
     except Exception as e:
-        print(f"DEBUG: 读取日志报错 {e}")
-        rows_html = f"<tr><td colspan='2' style='color:#ef4444;'>读取日志失败: {str(e)}</td></tr>"
-
-    if not rows_html:
-        rows_html = "<tr><td colspan='2' style='color:#94a3b8;'>暂无查询记录</td></tr>"
+        print(f"DEBUG: 实时轨迹查询失败 {e}")
+        trace_rows = f"<tr><td colspan='3' style='color:#ef4444;'>加载失败: {str(e)}</td></tr>"
+    if not trace_rows:
+        trace_rows = "<tr><td colspan='3' style='color:#94a3b8;'>暂无查询记录</td></tr>"
 
     return f"""
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>查询日志 · 管理面板</title>
-        <style>
-            body {{ font-family: 'Segoe UI', -apple-system, sans-serif; background: #f8fafc; padding: 40px; margin: 0; }}
-            .container {{ max-width: 800px; margin: 0 auto; }}
-            h2 {{ color: #1e293b; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; }}
-            .back-btn {{ font-size: 14px; color: #3b82f6; text-decoration: none; padding: 6px 12px; background: #e0f2fe; border-radius: 6px; font-weight: bold; }}
-            table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }}
-            th {{ background: #3b82f6; color: white; padding: 14px 20px; text-align: left; font-size: 15px; font-weight: 600; }}
-            td {{ padding: 12px 20px; border-bottom: 1px solid #f1f5f9; font-size: 14px; color: #475569; }}
-            tr:last-child td {{ border-bottom: none; }}
-            tr:hover {{ background: #f8fafc; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>📋 后台查询日志 <a href="/" class="back-btn">← 返回首页</a></h2>
-            <table>
-                <thead><tr><th width="180px">查询时间</th><th>查询的 UID</th></tr></thead>
-                <tbody>{rows_html}</tbody>
-            </table>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理面板 · 查询日志</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            background: #0f172a; color: #e2e8f0; min-height: 100vh;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            border-bottom: 1px solid #334155; padding: 20px 40px;
+            display: flex; align-items: center; justify-content: space-between;
+        }}
+        .header h1 {{ font-size: 22px; font-weight: 700; letter-spacing: 0.5px; }}
+        .header a {{
+            color: #38bdf8; text-decoration: none; font-size: 14px;
+            padding: 8px 18px; background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.25);
+            border-radius: 8px; transition: all 0.2s;
+        }}
+        .header a:hover {{ background: rgba(56,189,248,0.2); }}
+        .container {{ max-width: 1200px; margin: 0 auto; padding: 30px 40px; }}
+        /* ---- 数据大盘卡片 ---- */
+        .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+        .card {{
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            border: 1px solid #334155; border-radius: 16px; padding: 24px;
+            position: relative; overflow: hidden;
+        }}
+        .card::before {{
+            content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%;
+        }}
+        .card:nth-child(1)::before {{ background: #3b82f6; }}
+        .card:nth-child(2)::before {{ background: #10b981; }}
+        .card:nth-child(3)::before {{ background: #f59e0b; }}
+        .card-label {{ font-size: 13px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }}
+        .card-value {{ font-size: 36px; font-weight: 800; }}
+        .card:nth-child(1) .card-value {{ color: #60a5fa; }}
+        .card:nth-child(2) .card-value {{ color: #34d399; }}
+        .card:nth-child(3) .card-value {{ color: #fbbf24; }}
+        /* ---- Tab 切换 ---- */
+        .tabs {{ display: flex; gap: 0; margin-bottom: 0; border-bottom: 2px solid #334155; }}
+        .tab-btn {{
+            padding: 12px 28px; font-size: 15px; font-weight: 600; cursor: pointer;
+            background: none; border: none; color: #64748b;
+            border-bottom: 3px solid transparent; transition: all 0.2s;
+            font-family: inherit;
+        }}
+        .tab-btn.active {{ color: #38bdf8; border-bottom-color: #38bdf8; }}
+        .tab-btn:hover:not(.active) {{ color: #94a3b8; }}
+        .tab-panel {{ display: none; }}
+        .tab-panel.active {{ display: block; }}
+        /* ---- 表格 ---- */
+        .table-wrap {{
+            background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+            overflow: hidden; margin-top: 16px;
+        }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th {{
+            background: #0f172a; color: #94a3b8; padding: 14px 18px;
+            text-align: left; font-size: 12px; font-weight: 600;
+            text-transform: uppercase; letter-spacing: 0.8px; border-bottom: 1px solid #334155;
+        }}
+        td {{
+            padding: 12px 18px; border-bottom: 1px solid #1e293b;
+            font-size: 14px; color: #cbd5e1;
+        }}
+        tr:last-child td {{ border-bottom: none; }}
+        tbody tr:hover {{ background: rgba(56,189,248,0.05); }}
+        .empty-cell {{ color: #475569; text-align: center; padding: 40px; }}
+        .error-cell {{ color: #f87171; text-align: center; padding: 40px; }}
+        /* ---- 响应式 ---- */
+        @media (max-width: 768px) {{
+            .header, .container {{ padding: 16px 20px; }}
+            .cards {{ grid-template-columns: 1fr; }}
+            .card-value {{ font-size: 28px; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>⚙️ 管理面板</h1>
+        <a href="/">← 返回首页</a>
+    </div>
+    <div class="container">
+        <!-- 数据大盘卡片 -->
+        <div class="cards">
+            <div class="card">
+                <div class="card-label">📊 总查询次数</div>
+                <div class="card-value">{total_queries}</div>
+            </div>
+            <div class="card">
+                <div class="card-label">👥 独立用户数</div>
+                <div class="card-value">{unique_users}</div>
+            </div>
+            <div class="card">
+                <div class="card-label">📅 今日查询</div>
+                <div class="card-value">{today_queries}</div>
+            </div>
         </div>
-    </body>
-    </html>
-    """
+
+        <!-- Tab 切换 -->
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('detail')">👤 用户明细</button>
+            <button class="tab-btn" onclick="switchTab('trace')">📜 实时轨迹</button>
+        </div>
+
+        <!-- Tab1: 用户明细 -->
+        <div id="tab-detail" class="tab-panel active">
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>用户</th>
+                            <th style="text-align:center;">查询次数</th>
+                            <th>最近查询</th>
+                            <th>历史 UID</th>
+                        </tr>
+                    </thead>
+                    <tbody>{user_detail_rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Tab2: 实时轨迹 -->
+        <div id="tab-trace" class="tab-panel">
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th width="180px">查询时间</th>
+                            <th width="180px">操作用户</th>
+                            <th>UID 列表</th>
+                        </tr>
+                    </thead>
+                    <tbody>{trace_rows}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(name) {{
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.querySelector('.tab-btn[onclick*="' + name + '"]').classList.add('active');
+            document.getElementById('tab-' + name).classList.add('active');
+        }}
+    </script>
+</body>
+</html>
+"""
